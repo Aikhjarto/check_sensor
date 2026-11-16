@@ -1,0 +1,47 @@
+{
+"coretemp-isa-0000":{
+   "Adapter": "ISA adapter",
+      "Package id 0":{
+         "temp1_input": 45.000,
+         "temp1_max": 80.000,
+         "temp1_crit": 100.000,
+         "temp1_crit_alarm": 0.000
+      },
+      "Core 0":{
+         "temp2_input": 43.000,
+         "temp2_max": 80.000,
+         "temp2_crit": 100.000,
+         "temp2_crit_alarm": 0.000
+      }
+},
+"nct6775-isa-0290":{
+   "Adapter": "ISA adapter",
+      "Vcore":{
+         "in0_input": 1.104,
+         "in0_min": 0.500,
+         "in0_max": 1.744,
+         "in0_alarm": 0.000,
+         "in0_beep": 0.000
+      },
+      "fan1":{
+         "fan1_input": 1205.000,
+         "fan1_min": 300.000,
+         "fan1_alarm": 0.000,
+         "fan1_beep": 0.000
+      },
+      "SYSTIN":{
+         "temp7_input": 35.000,
+         "temp7_max": 80.000,
+         "temp7_max_hyst": 75.000,
+         "temp7_alarm": 0.000,
+         "temp7_type": 4.000
+      }
+},
+"acpitz-acpi-0":{
+   "Adapter": "ACPI interface",
+      "temp1":{
+         "temp1_input": 27.800,
+         "temp1_crit": 105.000
+      }
+}
+}

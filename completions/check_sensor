@@ -1,0 +1,35 @@
+# bash completion for check_sensor                           -*- shell-script -*-
+
+_check_sensor()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local i chip=""
+    COMPREPLY=()
+
+    # the chip given with -a, if any
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        [ "${COMP_WORDS[i]}" != "-a" ] || chip=${COMP_WORDS[i+1]}
+    done
+
+    case $prev in
+        -a)
+            # chips, from the list of sensors
+            mapfile -t COMPREPLY < <(compgen -W "$("${COMP_WORDS[0]}" -l 2>/dev/null \
+                | awk -F '\t' 'NR > 1 { print $1 }' | sort -u)" -- "$cur")
+            return
+            ;;
+        -s)
+            # sensor names, on the chip given with -a
+            mapfile -t COMPREPLY < <(compgen -W "$("${COMP_WORDS[0]}" -l ${chip:+-a "$chip"} 2>/dev/null \
+                | awk -F '\t' 'NR > 1 { print $2 }' | sort -u)" -- "$cur")
+            return
+            ;;
+        -w | -c | -t)
+            return
+            ;;
+    esac
+
+    # no positional arguments: offer the options
+    mapfile -t COMPREPLY < <(compgen -W '-s -a -w -c -l -t -v -V -h' -- "$cur")
+}
+complete -F _check_sensor check_sensor

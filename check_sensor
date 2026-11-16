@@ -1,238 +1,316 @@
 #!/bin/bash
+# Nagios/Icinga plugin to check a hardware sensor read by lm-sensors.
 #
-# This script is a nagios plugin and checks for sensor values given by lmsensors.
-# 
-# Copyright (C) 2026 Thomas Wagner
-# 
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
-# 
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-# 
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+# Copyright (C) 2026 Thomas Wagner <wagner-thomas@gmx.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
 
-usage ()
-{
-cat << EOF
-usage:
-This scripts checks sensor values from lmsensors and reports in a nagios compatible way. See https://nagios-plugins.org/doc/guidelines.html
+VERSION=0.1
 
-Before using this script, ensure all modules needed for your hardware are loaded (execute /usr/sbin/sensors-detect if your are in doubt).
+export LC_ALL=C
 
-If the command `sensors -J` provides a min and a max value, the status is reported as OK if the input value is within min and max. State CRITICAL is reported otherwise.
-If the command `sensors -J` provides a max and a crit value, they are translated to level for warning an critical of nagios.
-If "-w WARN_LVL" and "-c CRIT_LVL" are given, limits given by lmsensors are ignored and the values given are used to determine the state.
-
-Note: For temperature values, warn level needs to be set lower than crit level. For fan speed values, crit level needs to be set lower than warn level.
-
-OPTIONS:
- -h     Show this message
- -s sensor_name  sensor name (execute 'sensors -J' to see whats available on your system)
- -a ADAPTER  adapter (execute 'sensors' and see string in line prior "Adapter:" for valid values)
- -c CRIT_LVL  critical level
- -w WARN_LVL  warning level
- -v     verbose mode for debugging
-EOF
-}
-
-# nagios expects one of these as return values
 STATE_OK=0
 STATE_WARNING=1
 STATE_CRITICAL=2
 STATE_UNKNOWN=3
-STATE_DEPENDENT=4
 
-WARN_LVL=""
-CRIT_LVL=""
+usage()
+{
+cat << EOF
+Usage: check_sensor -s SENSOR [-a CHIP] [-w WARN] [-c CRIT] [-t SECONDS]
+       check_sensor -l [-a CHIP]
 
-# parse input
-while getopts "hs:c:w:a:rv" OPTION
+Checks a hardware sensor, such as a temperature, fan speed or voltage, that
+lm-sensors reads. Make sure the modules for your hardware are loaded; run
+sensors-detect if in doubt.
+
+Without -w and -c, the limits the chip reports are used:
+ - CRITICAL above crit or below lcrit
+ - WARNING above max or below min if the chip also reports crit or lcrit,
+   CRITICAL otherwise
+ - WARNING if the chip raises an alarm, CRITICAL for a crit or lcrit alarm
+With -w and/or -c, the limits of the chip are ignored. If CRIT is greater
+than WARN (e.g. temperatures), values above them alert; if CRIT is less than
+WARN (e.g. fan speeds), values below them alert. A single -w or -c is an
+upper limit. A sensor fault is always CRITICAL.
+
+-s SENSOR   the sensor, by name (e.g. temp1) or label (e.g. "Package id 0")
+-a CHIP     the chip (e.g. coretemp-isa-0000); needed only if several chips
+            have the sensor
+-w WARN     warning level
+-c CRIT     critical level
+-l          list the sensors with their chip, name, label, value and limits
+-t SECONDS  give up after this many seconds (default 10)
+-v          verbose mode for debugging
+-V          show the version
+-h          show this help
+EOF
+}
+
+unknown()
+{
+    echo "SENSOR UNKNOWN - $1"
+    exit $STATE_UNKNOWN
+}
+
+is_number()
+{
+    [[ $1 =~ ^-?([0-9]+\.?[0-9]*|\.[0-9]+)$ ]]
+}
+
+# compare A OP B: true if the decimal numbers satisfy A OP B (OP is <, <=, > or >=)
+compare()
+{
+    awk -v a="$1" -v b="$3" -v op="$2" 'BEGIN {
+        if (op == "<") r = a < b; else if (op == "<=") r = a <= b
+        else if (op == ">") r = a > b; else r = a >= b
+        exit !r }'
+}
+
+# number VALUE: a value without trailing zeros (45.000 -> 45, 1.250 -> 1.25)
+number()
+{
+    awk -v v="$1" 'BEGIN { printf "%.3f", v }' | sed -e 's/0*$//' -e 's/\.$//'
+}
+
+CHIP=""
+SENSOR=""
+WARN=""
+CRIT=""
+LIST=""
+TIMEOUT=10
+
+while getopts ":hVs:a:w:c:lt:v" OPTION
 do
-        case $OPTION in
-                h) usage
-                  exit $STATE_UNKNOWN
-                  ;;
-                w) WARN_LVL=$OPTARG
-                   ;;
-                c) CRIT_LVL=$OPTARG
-                   ;;
-                s) SENSOR=$OPTARG
-                   ;;
-                a) ADAPTER=$OPTARG
-                   ;;
-                v) VERBOSE=1;
-                   ;;
-                *) echo "unknown parameter"
-                   exit $STATE_UNKNOWN
-                   ;;
-        esac
+    case $OPTION in
+        h) usage
+           exit $STATE_UNKNOWN
+           ;;
+        V) echo "check_sensor $VERSION"
+           exit $STATE_UNKNOWN
+           ;;
+        s) SENSOR=$OPTARG ;;
+        a) CHIP=$OPTARG ;;
+        w) WARN=$OPTARG ;;
+        c) CRIT=$OPTARG ;;
+        l) LIST=1 ;;
+        t) TIMEOUT=$OPTARG ;;
+        v) set -x ;;
+        :) unknown "option -$OPTARG needs an argument" ;;
+        ?) unknown "unknown option -$OPTARG" ;;
+    esac
 done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || unknown "unexpected argument $1"
+[ -n "$LIST" ] || [ -n "$SENSOR" ] || unknown "the sensor must be given with -s; -l lists them"
+[ -z "$WARN" ] || is_number "$WARN" || unknown "the warning level must be a number, not '$WARN'"
+[ -z "$CRIT" ] || is_number "$CRIT" || unknown "the critical level must be a number, not '$CRIT'"
+[[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || unknown "the timeout must be a positive number of seconds, not '$TIMEOUT'"
+command -v sensors > /dev/null || unknown "sensors not found, install lm-sensors"
+command -v jq > /dev/null || unknown "jq not found, install jq"
+command -v timeout > /dev/null || unknown "timeout not found, install coreutils"
 
-if [ "${VERBOSE}" = 1 ]; then
-    set -x
-fi
+ERRORS=$(mktemp) || unknown "cannot create a temporary file"
+trap 'rm -f "$ERRORS"' EXIT
 
-# adapter must be given
-if [ -z "${ADAPTER}" ]; then
-    printf "UNKNOWN - Adapter must be given\n"
-    exit $STATE_UNKNOWN
-fi
+# read_sensors FORMAT: the JSON of sensors -J or -j, for one chip if -a is given
+read_sensors()
+{
+    local args=("$1")
+    [ -z "$CHIP" ] || args+=("$CHIP")
+    timeout "$TIMEOUT" sensors "${args[@]}" 2> "$ERRORS"
+}
 
-# sensor must be given
-if [ -z "${SENSOR}" ]; then
-    printf "UNKNOWN - Sensor must be given\n"
-    exit $STATE_UNKNOWN
+# lm-sensors 3.6.2 and later: sensors -J, keyed by the feature name, with value, unit and label
+JSON=$(read_sensors -J)
+RC=$?
+FORMAT=new
+if [ $RC -ne 0 ] && grep -q -i "invalid option" "$ERRORS"; then
+    # older lm-sensors: sensors -j, keyed by the label, with values like "temp1_input": 45.000
+    JSON=$(read_sensors -j)
+    RC=$?
+    FORMAT=old
 fi
-
-# if warn is given, crit must be given and vice versa
-if [ -n "${WARN_LVL}" -a -z "${CRIT_LVL}" ]; then
-    printf "UNKNOWN - If warn level is given, crit level must be given as well\n"
-    exit $STATE_UNKNOWN
-fi
-if [ -z "${WARN_LVL}" -a -n "${CRIT_LVL}" ]; then
-    printf "UNKNOWN - If crit level is given, warn level must be given as well\n"
-    exit $STATE_UNKNOWN
-fi
-
-# read sensors on given adapter as JSON
-SENSORS_JSON=$(sensors -J $ADAPTER)
-if [ $? != 0 ]; then
-    printf "UNKNOWN - Command sensors returned with exit value %d and %s\n" $? "${SENSOR_JSON}"
-    exit $STATE_UNKNOWN
-fi
-
-# Get sensor value. It is either a number or "null"
-SENSOR_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"input\"][\"value\"]" <<< "$SENSORS_JSON")
-if [ $? -ne 0 ]; then
-    printf "UNKNOWN - Cannot read sensor %s from adapter %s\n" "${SENSOR}" "${ADAPTER}"
-    exit $STATE_UNKNOWN
+[ $RC -ne 124 ] || unknown "sensors did not answer within ${TIMEOUT}s"
+if [ $RC -ne 0 ]; then
+    ERROR=$(grep -m 1 . "$ERRORS")
+    unknown "sensors failed with status $RC: ${ERROR:-no message}"
 fi
 
-# Get bounds for sensor value. They are either a number or "null"
-# Note: sensors can provide a min/max pair or a max/crit pair with a sensor value.
-MIN_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"min\"][\"value\"]" <<< "$SENSORS_JSON")
-if [ $? -ne 0 ]; then
-    MIN_VALUE=""
-fi
-MAX_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"max\"][\"value\"]" <<< "$SENSORS_JSON")
-if [ $? -ne 0 ]; then
-    MAX_VALUE=""
-fi
-CRIT_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"crit\"][\"value\"]" <<< "$SENSORS_JSON")
-if [ $? -ne 0 ]; then
-    CRIT_VALUE=""
+# NaN (an unreadable value) is not valid JSON
+JSON=$(sed -E 's/(:[[:space:]]*)-?(NaN|nan|inf|-inf)\b/\1null/g' <<< "$JSON")
+
+# both formats as {chip: {"Adapter": name, feature: {"label": label, subfeature: {"value": v, "unit": u}}}}
+NORMALIZE='
+if $format == "old" then
+  map_values(with_entries(
+    if .key == "Adapter" then .
+    else .key as $name
+      | ([.value | keys[] | select(test("_"))][0] // $name | split("_")[0]) as $feature
+      | {key: $feature,
+         value: ({"label": $name}
+                 + (.value | with_entries(.key |= sub("^[^_]*_"; "") | .value |= {value: .})))}
+    end))
+else . end'
+JSON=$(jq --arg format "$FORMAT" "$NORMALIZE" <<< "$JSON" 2>&1) || unknown "cannot read the output of sensors: $(head -n 1 <<< "$JSON")"
+
+# one line per sensor, the fields separated by the unit separator 0x1f (read keeps empty
+# fields only with a non-blank separator): chip, adapter, feature, label, unit, input, min, max, lcrit, crit,
+# fault, alarm, crit alarm
+FIELDS='
+def v($f): (.[$f].value // "") | tostring;
+def alarm($fs): [ $fs[] as $f | .[$f].value // 0 ] | if any(. == 1) then "1" else "" end;
+to_entries[] | .key as $chip | (.value.Adapter // "") as $adapter
+| .value | to_entries[] | select(.key != "Adapter" and (.value | type) == "object")
+| .key as $feature | .value
+| [$chip, $adapter, $feature, (.label // $feature), (.input.unit // ""),
+   v("input"), v("min"), v("max"), v("lcrit"), v("crit"),
+   alarm(["fault"]), alarm(["alarm", "min_alarm", "max_alarm"]),
+   alarm(["crit_alarm", "lcrit_alarm", "emergency_alarm"])]
+| join("\u001f")'
+LINES=$(jq -r "$FIELDS" <<< "$JSON") || unknown "cannot read the sensors"
+
+# unit FEATURE: the unit from the feature name, for sensors -j, which has none
+unit()
+{
+    case $1 in
+        temp*) echo "°C" ;;
+        in*) echo "V" ;;
+        fan*) echo "RPM" ;;
+        power*) echo "W" ;;
+        curr*) echo "A" ;;
+        energy*) echo "J" ;;
+        humidity*) echo "%RH" ;;
+    esac
+}
+
+if [ -n "$LIST" ]; then
+    [ -n "$LINES" ] || unknown "sensors found no sensors"
+    printf '%s\t%s\t%s\t%s\t%s\n' CHIP SENSOR LABEL VALUE LIMITS
+    while IFS=$'\x1f' read -r chip adapter feature label u input min max lcrit crit fault alarm critalarm; do
+        [ -n "$u" ] || u=$(unit "$feature")
+        limits=""
+        for limit in "min=$min" "max=$max" "lcrit=$lcrit" "crit=$crit"; do
+            [ -z "${limit#*=}" ] || limits+="${limits:+ }${limit%%=*} $(number "${limit#*=}")"
+        done
+        [ -z "$input" ] || input="$(number "$input")$u"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$chip" "$feature" "$label" "${input:--}" "${limits:--}"
+    done <<< "$LINES"
+    exit $STATE_OK
 fi
 
-# translate max/crit bounds to warn/crit levels
-if [ -n "${MAX_VALUE}" -a -n "${CRIT_VALUE}" ]; then      
-    if [ -z "${WARN_LVL}" -a -n "${MAX_VALUE}" ]; then
-        WARN_LVL=${MAX_VALUE}
-        MAX_VALUE=""
+MATCHES=$(awk -F '\037' -v s="$SENSOR" '$3 == s || $4 == s' <<< "$LINES")
+[ -n "$MATCHES" ] || unknown "no sensor $SENSOR${CHIP:+ on $CHIP}; -l lists the sensors"
+if [ "$(wc -l <<< "$MATCHES")" -gt 1 ]; then
+    unknown "several sensors match $SENSOR, choose one with -a or by name: $(awk -F '\037' '{ printf "%s%s %s", sep, $1, $3; sep = ", " }' <<< "$MATCHES")"
+fi
+IFS=$'\x1f' read -r CHIP ADAPTER FEATURE LABEL UNIT VALUE MIN MAX LCRIT CRIT_LIMIT FAULT ALARM CRIT_ALARM <<< "$MATCHES"
+[ -n "$UNIT" ] || UNIT=$(unit "$FEATURE")
+[ -n "$VALUE" ] || unknown "$LABEL on $CHIP has no readable value"
+
+STATE=$STATE_OK
+REASON=""
+# raise STATE TEXT: raise the state to STATE, and add TEXT to the reasons
+raise()
+{
+    [ "$1" -le "$STATE" ] || STATE=$1
+    REASON+="${REASON:+, }$2"
+}
+
+if [ -n "$FAULT" ]; then
+    raise $STATE_CRITICAL "sensor fault"
+fi
+
+if [ -n "$WARN$CRIT" ]; then
+    # the levels given override the limits of the chip
+    LOW=""
+    if [ -n "$WARN" ] && [ -n "$CRIT" ] && compare "$CRIT" "<" "$WARN"; then
+        LOW=1
     fi
-    if [ -z "${CRIT_LVL}" -a -n "${CRIT_VALUE}" ]; then
-        CRIT_LVL=${CRIT_VALUE}
-    fi
-fi
-
-# Get sensor label. It is either a string or "null"
-SENSOR_LABEL=$(jq -r -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"label\"]" <<< "$SENSORS_JSON")
-if [ $? -ne 0 ]; then
-    SENSOR_LABEL=$SENSOR
-fi
-
-# Get adapter label. It is either a string or "null"
-ADAPTER_LABEL=$(jq -r -e ".[\"$ADAPTER\"][\"Adapter\"]" <<< "$SENSORS_JSON")
-if [ $? -ne 0 ]; then
-    ADAPTER_LABEL=$ADAPTER
-fi
-
-# Get unit. It is either a string or "null"
-UNIT=$(jq -r -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"input\"][\"unit\"]" <<< "$SENSORS_JSON")
-if [  $? -ne 0 ]; then
-    UNIT=""
-fi
-
-# Assemble performance data and value string for nagios output
-PERF_DATA="|$ADAPTER-$SENSOR=${SENSOR_VALUE}${UNIT};$WARN_LVL;$CRIT_LVL;$MIN_VALUE;$MAX_VALUE"
-VALUE_STRING="${SENSOR_LABEL} on ${ADAPTER_LABEL} is ${SENSOR_VALUE}${UNIT}"
-
-if [ -n "${MIN_VALUE}" -a -n "${MAX_VALUE}" ]; then
-    JQ_FILTER="${SENSOR_VALUE} > ${MIN_VALUE} and ${SENSOR_VALUE} < ${MAX_VALUE}"
-    RES=$(jq -n "${JQ_FILTER}")
-    if [ $? -ne 0 ]; then
-        printf "UNKNOWN - Comparison %s failed" "${JQ_FILTER}\n"
-        exit $STATE_UNKNOWN
-    fi
-    if [ "${RES}" = "false" ]; then
-        printf "CRITICAL - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
-        exit $STATE_CRITICAL
-    fi
-elif [ -n "${WARN_LVL}" -a -n "${CRIT_LVL}" ]; then
-    JQ_FILTER="${CRIT_LVL} > ${WARN_LVL}"
-    RES=$(jq -n "${JQ_FILTER}")
-    if [ $? -ne 0 ]; then
-        printf "UNKNOWN - Comparison %s failed" "${JQ_FILTER}\n"
-        exit $STATE_UNKNOWN
-    fi
-    if [ "${RES}" = "true" ]; then
-
-        JQ_FILTER="${SENSOR_VALUE} > ${CRIT_LVL}"
-        RES=$(jq -n "${JQ_FILTER}")
-        if [ $? -ne 0 ]; then
-            printf "UNKNOWN - Comparison %s (VAL > CRIT) failed" "${JQ_FILTER}\n"
-            exit $STATE_UNKNOWN
+    if [ -n "$LOW" ]; then
+        if compare "$VALUE" "<" "$CRIT"; then
+            raise $STATE_CRITICAL "below $(number "$CRIT")$UNIT"
+        elif compare "$VALUE" "<" "$WARN"; then
+            raise $STATE_WARNING "below $(number "$WARN")$UNIT"
         fi
-
-        if [ "${RES}" = "true" ]; then
-            printf "CRITICAL - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
-            exit $STATE_CRITICAL
-        fi
-
-        JQ_FILTER="${SENSOR_VALUE} > ${WARN_LVL}"
-        RES=$(jq -n "${JQ_FILTER}")
-        if [ $? -ne 0 ]; then
-            printf "UNKNOWN - Comparison %s (VAL > WARN) failed" "${JQ_FILTER}\n"
-            exit $STATE_UNKNOWN
-        fi
-
-        if [ "${RES}" = "true" ]; then
-            printf "WARNING - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
-            exit $STATE_WARNING
-        fi
-    else # inverse logic if crit less than warn for e.g. fan's rpm.
-        JQ_FILTER="${SENSOR_VALUE} < ${CRIT_LVL}"
-        RES=$(jq -n "${JQ_FILTER}")
-        if [ $? -ne 0 ]; then
-            printf "UNKNOWN - Comparison %s (VAL < CRIT) failed" "${JQ_FILTER}\n"
-            exit $STATE_UNKNOWN
-        fi
-
-        if [ "${RES}" = "true" ]; then
-            printf "CRITICAL - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
-            exit $STATE_CRITICAL
-        fi
-
-        JQ_FILTER="${SENSOR_VALUE} < ${WARN_LVL}"
-        RES=$(jq -n "${JQ_FILTER}")
-        if [ $? -ne 0 ]; then
-            printf "UNKNOWN - Comparison %s (VAL < WARN) failed" "${JQ_FILTER}\n"
-            exit $STATE_UNKNOWN
-        fi
-
-        if [ "${RES}" = "true" ]; then
-            printf "WARNING - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
-            exit $STATE_WARNING
+    else
+        if [ -n "$CRIT" ] && compare "$VALUE" ">" "$CRIT"; then
+            raise $STATE_CRITICAL "above $(number "$CRIT")$UNIT"
+        elif [ -n "$WARN" ] && compare "$VALUE" ">" "$WARN"; then
+            raise $STATE_WARNING "above $(number "$WARN")$UNIT"
         fi
     fi
+    # perfdata ranges: lower limits as N:
+    PERF_WARN=$WARN${LOW:+:}
+    PERF_CRIT=$CRIT${LOW:+:}
+else
+    if [ -n "$CRIT_LIMIT" ] && compare "$VALUE" ">" "$CRIT_LIMIT"; then
+        raise $STATE_CRITICAL "above crit $(number "$CRIT_LIMIT")$UNIT"
+    elif [ -n "$MAX" ] && compare "$VALUE" ">" "$MAX"; then
+        if [ -n "$CRIT_LIMIT" ]; then
+            raise $STATE_WARNING "above max $(number "$MAX")$UNIT"
+        else
+            raise $STATE_CRITICAL "above max $(number "$MAX")$UNIT"
+        fi
+    fi
+    if [ -n "$LCRIT" ] && compare "$VALUE" "<" "$LCRIT"; then
+        raise $STATE_CRITICAL "below lcrit $(number "$LCRIT")$UNIT"
+    elif [ -n "$MIN" ] && compare "$VALUE" "<" "$MIN"; then
+        if [ -n "$LCRIT" ]; then
+            raise $STATE_WARNING "below min $(number "$MIN")$UNIT"
+        else
+            raise $STATE_CRITICAL "below min $(number "$MIN")$UNIT"
+        fi
+    fi
+    if [ -n "$CRIT_ALARM" ]; then
+        raise $STATE_CRITICAL "critical alarm of the chip"
+    elif [ -n "$ALARM" ]; then
+        raise $STATE_WARNING "alarm of the chip"
+    fi
+    # perfdata ranges: an upper limit as a number, a lower one as N:
+    PERF_WARN=$MAX
+    PERF_CRIT=$CRIT_LIMIT
+    if [ -z "$PERF_CRIT" ] && [ -n "$MAX" ]; then
+        PERF_WARN=""
+        PERF_CRIT=$MAX
+    fi
+    if [ -n "$MIN" ]; then
+        if [ -n "$LCRIT" ]; then
+            PERF_WARN="${MIN}:${PERF_WARN}"
+        else
+            PERF_CRIT="${MIN}:${PERF_CRIT}"
+        fi
+    fi
+    [ -z "$LCRIT" ] || PERF_CRIT="${LCRIT}:${PERF_CRIT}"
 fi
 
-printf "OK - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
-exit $STATE_OK
+case $STATE in
+    "$STATE_OK") TEXT=OK ;;
+    "$STATE_WARNING") TEXT=WARNING ;;
+    *) TEXT=CRITICAL ;;
+esac
 
+# the label of the perfdata: chip-feature as before; quoted if it has blanks or quotes
+PERF_LABEL="$CHIP-$FEATURE"
+if [[ $PERF_LABEL == *[[:space:]\'=]* ]]; then
+    PERF_LABEL="'${PERF_LABEL//\'/\'\'}'"
+fi
+# perfdata ranges with the numbers as in the output (80.000 -> 80)
+perf_range()
+{
+    local range=$1 out="" part
+    while [[ $range =~ ^([^:]*)(:?)(.*)$ ]]; do
+        part=${BASH_REMATCH[1]}
+        [ -z "$part" ] || out+=$(number "$part")
+        out+=${BASH_REMATCH[2]}
+        range=${BASH_REMATCH[3]}
+        [ -n "${BASH_REMATCH[2]}" ] || break
+    done
+    echo "$out"
+}
+PERF_WARN=$(perf_range "$PERF_WARN")
+PERF_CRIT=$(perf_range "$PERF_CRIT")
+PERF_UNIT=""
+[ "$UNIT" != "%RH" ] || PERF_UNIT="%"
+
+echo "SENSOR $TEXT - $LABEL on ${ADAPTER:-$CHIP} is $(number "$VALUE")$UNIT${REASON:+ ($REASON)}|$PERF_LABEL=$(number "$VALUE")$PERF_UNIT;$PERF_WARN;$PERF_CRIT;;"
+exit "$STATE"
