@@ -1,0 +1,238 @@
+#!/bin/bash
+#
+# This script is a nagios plugin and checks for sensor values given by lmsensors.
+# 
+# Copyright (C) 2026 Thomas Wagner
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+usage ()
+{
+cat << EOF
+usage:
+This scripts checks sensor values from lmsensors and reports in a nagios compatible way. See https://nagios-plugins.org/doc/guidelines.html
+
+Before using this script, ensure all modules needed for your hardware are loaded (execute /usr/sbin/sensors-detect if your are in doubt).
+
+If the command `sensors -J` provides a min and a max value, the status is reported as OK if the input value is within min and max. State CRITICAL is reported otherwise.
+If the command `sensors -J` provides a max and a crit value, they are translated to level for warning an critical of nagios.
+If "-w WARN_LVL" and "-c CRIT_LVL" are given, limits given by lmsensors are ignored and the values given are used to determine the state.
+
+Note: For temperature values, warn level needs to be set lower than crit level. For fan speed values, crit level needs to be set lower than warn level.
+
+OPTIONS:
+ -h     Show this message
+ -s sensor_name  sensor name (execute 'sensors -J' to see whats available on your system)
+ -a ADAPTER  adapter (execute 'sensors' and see string in line prior "Adapter:" for valid values)
+ -c CRIT_LVL  critical level
+ -w WARN_LVL  warning level
+ -v     verbose mode for debugging
+EOF
+}
+
+# nagios expects one of these as return values
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+STATE_DEPENDENT=4
+
+WARN_LVL=""
+CRIT_LVL=""
+
+# parse input
+while getopts "hs:c:w:a:rv" OPTION
+do
+        case $OPTION in
+                h) usage
+                  exit $STATE_UNKNOWN
+                  ;;
+                w) WARN_LVL=$OPTARG
+                   ;;
+                c) CRIT_LVL=$OPTARG
+                   ;;
+                s) SENSOR=$OPTARG
+                   ;;
+                a) ADAPTER=$OPTARG
+                   ;;
+                v) VERBOSE=1;
+                   ;;
+                *) echo "unknown parameter"
+                   exit $STATE_UNKNOWN
+                   ;;
+        esac
+done
+
+if [ "${VERBOSE}" = 1 ]; then
+    set -x
+fi
+
+# adapter must be given
+if [ -z "${ADAPTER}" ]; then
+    printf "UNKNOWN - Adapter must be given\n"
+    exit $STATE_UNKNOWN
+fi
+
+# sensor must be given
+if [ -z "${SENSOR}" ]; then
+    printf "UNKNOWN - Sensor must be given\n"
+    exit $STATE_UNKNOWN
+fi
+
+# if warn is given, crit must be given and vice versa
+if [ -n "${WARN_LVL}" -a -z "${CRIT_LVL}" ]; then
+    printf "UNKNOWN - If warn level is given, crit level must be given as well\n"
+    exit $STATE_UNKNOWN
+fi
+if [ -z "${WARN_LVL}" -a -n "${CRIT_LVL}" ]; then
+    printf "UNKNOWN - If crit level is given, warn level must be given as well\n"
+    exit $STATE_UNKNOWN
+fi
+
+# read sensors on given adapter as JSON
+SENSORS_JSON=$(sensors -J $ADAPTER)
+if [ $? != 0 ]; then
+    printf "UNKNOWN - Command sensors returned with exit value %d and %s\n" $? "${SENSOR_JSON}"
+    exit $STATE_UNKNOWN
+fi
+
+# Get sensor value. It is either a number or "null"
+SENSOR_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"input\"][\"value\"]" <<< "$SENSORS_JSON")
+if [ $? -ne 0 ]; then
+    printf "UNKNOWN - Cannot read sensor %s from adapter %s\n" "${SENSOR}" "${ADAPTER}"
+    exit $STATE_UNKNOWN
+fi
+
+# Get bounds for sensor value. They are either a number or "null"
+# Note: sensors can provide a min/max pair or a max/crit pair with a sensor value.
+MIN_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"min\"][\"value\"]" <<< "$SENSORS_JSON")
+if [ $? -ne 0 ]; then
+    MIN_VALUE=""
+fi
+MAX_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"max\"][\"value\"]" <<< "$SENSORS_JSON")
+if [ $? -ne 0 ]; then
+    MAX_VALUE=""
+fi
+CRIT_VALUE=$(jq -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"crit\"][\"value\"]" <<< "$SENSORS_JSON")
+if [ $? -ne 0 ]; then
+    CRIT_VALUE=""
+fi
+
+# translate max/crit bounds to warn/crit levels
+if [ -n "${MAX_VALUE}" -a -n "${CRIT_VALUE}" ]; then      
+    if [ -z "${WARN_LVL}" -a -n "${MAX_VALUE}" ]; then
+        WARN_LVL=${MAX_VALUE}
+        MAX_VALUE=""
+    fi
+    if [ -z "${CRIT_LVL}" -a -n "${CRIT_VALUE}" ]; then
+        CRIT_LVL=${CRIT_VALUE}
+    fi
+fi
+
+# Get sensor label. It is either a string or "null"
+SENSOR_LABEL=$(jq -r -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"label\"]" <<< "$SENSORS_JSON")
+if [ $? -ne 0 ]; then
+    SENSOR_LABEL=$SENSOR
+fi
+
+# Get adapter label. It is either a string or "null"
+ADAPTER_LABEL=$(jq -r -e ".[\"$ADAPTER\"][\"Adapter\"]" <<< "$SENSORS_JSON")
+if [ $? -ne 0 ]; then
+    ADAPTER_LABEL=$ADAPTER
+fi
+
+# Get unit. It is either a string or "null"
+UNIT=$(jq -r -e ".[\"$ADAPTER\"][\"$SENSOR\"][\"input\"][\"unit\"]" <<< "$SENSORS_JSON")
+if [  $? -ne 0 ]; then
+    UNIT=""
+fi
+
+# Assemble performance data and value string for nagios output
+PERF_DATA="|$ADAPTER-$SENSOR=${SENSOR_VALUE}${UNIT};$WARN_LVL;$CRIT_LVL;$MIN_VALUE;$MAX_VALUE"
+VALUE_STRING="${SENSOR_LABEL} on ${ADAPTER_LABEL} is ${SENSOR_VALUE}${UNIT}"
+
+if [ -n "${MIN_VALUE}" -a -n "${MAX_VALUE}" ]; then
+    JQ_FILTER="${SENSOR_VALUE} > ${MIN_VALUE} and ${SENSOR_VALUE} < ${MAX_VALUE}"
+    RES=$(jq -n "${JQ_FILTER}")
+    if [ $? -ne 0 ]; then
+        printf "UNKNOWN - Comparison %s failed" "${JQ_FILTER}\n"
+        exit $STATE_UNKNOWN
+    fi
+    if [ "${RES}" = "false" ]; then
+        printf "CRITICAL - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
+        exit $STATE_CRITICAL
+    fi
+elif [ -n "${WARN_LVL}" -a -n "${CRIT_LVL}" ]; then
+    JQ_FILTER="${CRIT_LVL} > ${WARN_LVL}"
+    RES=$(jq -n "${JQ_FILTER}")
+    if [ $? -ne 0 ]; then
+        printf "UNKNOWN - Comparison %s failed" "${JQ_FILTER}\n"
+        exit $STATE_UNKNOWN
+    fi
+    if [ "${RES}" = "true" ]; then
+
+        JQ_FILTER="${SENSOR_VALUE} > ${CRIT_LVL}"
+        RES=$(jq -n "${JQ_FILTER}")
+        if [ $? -ne 0 ]; then
+            printf "UNKNOWN - Comparison %s (VAL > CRIT) failed" "${JQ_FILTER}\n"
+            exit $STATE_UNKNOWN
+        fi
+
+        if [ "${RES}" = "true" ]; then
+            printf "CRITICAL - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
+            exit $STATE_CRITICAL
+        fi
+
+        JQ_FILTER="${SENSOR_VALUE} > ${WARN_LVL}"
+        RES=$(jq -n "${JQ_FILTER}")
+        if [ $? -ne 0 ]; then
+            printf "UNKNOWN - Comparison %s (VAL > WARN) failed" "${JQ_FILTER}\n"
+            exit $STATE_UNKNOWN
+        fi
+
+        if [ "${RES}" = "true" ]; then
+            printf "WARNING - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
+            exit $STATE_WARNING
+        fi
+    else # inverse logic if crit less than warn for e.g. fan's rpm.
+        JQ_FILTER="${SENSOR_VALUE} < ${CRIT_LVL}"
+        RES=$(jq -n "${JQ_FILTER}")
+        if [ $? -ne 0 ]; then
+            printf "UNKNOWN - Comparison %s (VAL < CRIT) failed" "${JQ_FILTER}\n"
+            exit $STATE_UNKNOWN
+        fi
+
+        if [ "${RES}" = "true" ]; then
+            printf "CRITICAL - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
+            exit $STATE_CRITICAL
+        fi
+
+        JQ_FILTER="${SENSOR_VALUE} < ${WARN_LVL}"
+        RES=$(jq -n "${JQ_FILTER}")
+        if [ $? -ne 0 ]; then
+            printf "UNKNOWN - Comparison %s (VAL < WARN) failed" "${JQ_FILTER}\n"
+            exit $STATE_UNKNOWN
+        fi
+
+        if [ "${RES}" = "true" ]; then
+            printf "WARNING - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
+            exit $STATE_WARNING
+        fi
+    fi
+fi
+
+printf "OK - %s%s\n" "${VALUE_STRING}" "${PERF_DATA}"
+exit $STATE_OK
+
